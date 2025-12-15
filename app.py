@@ -6,7 +6,11 @@ import matplotlib.pyplot as plt
 import altair as alt
 
 from utils.data_loader import load_or_download_prices, compute_returns
-from backtest.backtest_engine import rolling_backtest
+from backtest.backtest_engine import (
+    rolling_backtest,
+    rolling_backtest_predictive_hrp,
+)
+from models.regime_classifier import RegimeClassifierConfig
 from utils.metrics import portfolio_returns, sharpe_ratio, max_drawdown, turnover
 from models.hmm_regime import RegimeHMM
 
@@ -36,7 +40,7 @@ def run_backtests(returns_eval, lookback, rebalance_freq, risk_aversion, l2_reg)
     port_rets_mvo = portfolio_returns(weights_mvo, returns_eval)
     eq_mvo = (1 + port_rets_mvo).cumprod()
 
-    # Proposed: HMM + HRP
+    # Proposed: HMM + HRP (reactive)
     weights_hrp = rolling_backtest(
         returns_eval,
         lookback=lookback,
@@ -48,7 +52,33 @@ def run_backtests(returns_eval, lookback, rebalance_freq, risk_aversion, l2_reg)
     port_rets_hrp = portfolio_returns(weights_hrp, returns_eval)
     eq_hrp = (1 + port_rets_hrp).cumprod()
 
-    return weights_mvo, weights_hrp, port_rets_mvo, port_rets_hrp, eq_mvo, eq_hrp
+    # Predictive: HMM + HRP + classifier
+    clf_cfg = RegimeClassifierConfig(
+        model_type="logistic",
+        C=0.5,
+        crisis_weight=3.0,
+    )
+    weights_hrp_pred = rolling_backtest_predictive_hrp(
+        returns_df=returns_eval,
+        lookback=lookback,
+        rebalance_freq=rebalance_freq,
+        clf_cfg=clf_cfg,
+        p_crisis_threshold=0.3,
+    )
+    port_rets_hrp_pred = portfolio_returns(weights_hrp_pred, returns_eval)
+    eq_hrp_pred = (1 + port_rets_hrp_pred).cumprod()
+
+    return (
+        weights_mvo,
+        weights_hrp,
+        weights_hrp_pred,
+        port_rets_mvo,
+        port_rets_hrp,
+        port_rets_hrp_pred,
+        eq_mvo,
+        eq_hrp,
+        eq_hrp_pred,
+    )
 
 
 @st.cache_data
@@ -434,9 +464,17 @@ with tab_alloc:
     st.subheader("HRP vs Mean-Variance allocations")
 
     # Run backtests to get weights
-    weights_mvo, weights_hrp, _, _, _, _ = run_backtests(
-        returns_eval, lookback, rebalance_freq, risk_aversion, l2_reg
-    )
+    (
+        weights_mvo,
+        weights_hrp,
+        weights_hrp_pred,  # returned but not used here
+        port_rets_mvo,
+        port_rets_hrp,
+        port_rets_hrp_pred,  # returned but not used here
+        eq_mvo,
+        eq_hrp,
+        eq_hrp_pred,  # returned but not used here
+    ) = run_backtests(returns_eval, lookback, rebalance_freq, risk_aversion, l2_reg)
 
     st.markdown("Select a rebalance date to inspect weights.")
     common_dates = weights_mvo.index.intersection(weights_hrp.index)
@@ -571,33 +609,65 @@ with tab_alloc:
 with tab_backtest:
     st.subheader("Strategy backtest and performance")
 
-    # Run backtests
-    weights_mvo, weights_hrp, port_rets_mvo, port_rets_hrp, eq_mvo, eq_hrp = (
-        run_backtests(returns_eval, lookback, rebalance_freq, risk_aversion, l2_reg)
+    (
+        weights_mvo,
+        weights_hrp,
+        weights_hrp_pred,
+        port_rets_mvo,
+        port_rets_hrp,
+        port_rets_hrp_pred,
+        eq_mvo,
+        eq_hrp,
+        eq_hrp_pred,
+    ) = run_backtests(returns_eval, lookback, rebalance_freq, risk_aversion, l2_reg)
+
+    # ---------- Equity curves (dynamic zoom) ----------
+    st.markdown("### Equity curves")
+
+    eq_df = pd.DataFrame(
+        {
+            "MVO": eq_mvo,
+            "HRP": eq_hrp,
+            "HRP_Predictive": eq_hrp_pred,
+        }
     )
 
-    # ---------- Equity curves (clean chart) ----------
-    eq_df = pd.DataFrame({"MVO": eq_mvo, "HRP": eq_hrp})
+    col1, col2 = st.columns(2)
+    with col1:
+        zoom_start = st.date_input(
+            "Zoom start",
+            value=eq_df.index.min(),
+            min_value=eq_df.index.min(),
+            max_value=eq_df.index.max(),
+        )
+    with col2:
+        zoom_end = st.date_input(
+            "Zoom end",
+            value=eq_df.index.max(),
+            min_value=eq_df.index.min(),
+            max_value=eq_df.index.max(),
+        )
+
+    eq_zoom = eq_df.loc[str(zoom_start) : str(zoom_end)]
 
     # Long-form for Altair
     eq_long = (
-        eq_df.reset_index()
+        eq_zoom.reset_index()
         .melt(
-            id_vars=eq_df.index.name or "index",
-            value_vars=["MVO", "HRP"],
+            id_vars=eq_zoom.index.name or "index",
+            value_vars=list(eq_zoom.columns),
             var_name="strategy",
             value_name="equity",
         )
-        .rename(columns={eq_df.index.name or "index": "date"})
+        .rename(columns={eq_zoom.index.name or "index": "date"})
     )
 
-    st.markdown("### Equity curves")
-
-    # Tight y-range around data
     y_min = float(eq_long["equity"].min())
     y_max = float(eq_long["equity"].max())
     padding = (y_max - y_min) * 0.1 if y_max > y_min else 0.02
     y_domain = (max(0.8, y_min - padding), y_max + padding)
+
+    color_range = ["#1f77b4", "#ff7f0e", "#2ca02c"]
 
     base_eq = (
         alt.Chart(eq_long)
@@ -608,7 +678,7 @@ with tab_backtest:
             color=alt.Color(
                 "strategy:N",
                 title="",
-                scale=alt.Scale(range=["#1f77b4", "#ff7f0e"]),
+                scale=alt.Scale(range=color_range[: len(eq_zoom.columns)]),
             ),
         )
     )
@@ -626,21 +696,29 @@ with tab_backtest:
 
     # ---------- Performance metrics ----------
     st.markdown("### Performance metrics")
+
     metrics_data = {
         "Sharpe": [
             sharpe_ratio(port_rets_mvo),
             sharpe_ratio(port_rets_hrp),
+            sharpe_ratio(port_rets_hrp_pred),
         ],
         "Max drawdown": [
             max_drawdown(eq_mvo),
             max_drawdown(eq_hrp),
+            max_drawdown(eq_hrp_pred),
         ],
         "Turnover": [
             turnover(weights_mvo),
             turnover(weights_hrp),
+            turnover(weights_hrp_pred),
         ],
     }
-    metrics_df = pd.DataFrame(metrics_data, index=["HMM + MVO", "HMM + HRP"])
+
+    metrics_df = pd.DataFrame(
+        metrics_data,
+        index=["HMM + MVO", "HMM + HRP", "HMM + HRP (Predictive)"],
+    )
     st.dataframe(
         metrics_df.style.format(
             {
@@ -655,5 +733,14 @@ with tab_backtest:
     st.markdown("### Drawdowns")
     dd_mvo = eq_mvo / eq_mvo.cummax() - 1.0
     dd_hrp = eq_hrp / eq_hrp.cummax() - 1.0
-    dd_df = pd.DataFrame({"MVO": dd_mvo, "HRP": dd_hrp})
+    dd_pred = eq_hrp_pred / eq_hrp_pred.cummax() - 1.0
+
+    dd_df = pd.DataFrame(
+        {
+            "MVO": dd_mvo,
+            "HRP": dd_hrp,
+            "HRP_Predictive": dd_pred,
+        }
+    )
+
     st.area_chart(dd_df)
